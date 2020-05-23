@@ -994,11 +994,8 @@ int HID_API_EXPORT hid_get_feature_report(hid_device *dev, unsigned char *data, 
 }
 
 // Not supported by Linux HidRaw yet
-int HID_API_EXPORT HID_API_CALL hid_get_input_report(hid_device *dev, unsigned char *data, size_t length)
+int HID_API_EXPORT HID_API_CALL hid_get_input_report(hid_device *, unsigned char *, size_t)
 {
-    (void *) dev;
-    (void *) data;
-    (void *) length;
 	return -1;
 }
 
@@ -1033,12 +1030,8 @@ int HID_API_EXPORT_CALL hid_get_serial_number_string(hid_device *dev, wchar_t *s
 	return get_device_string(dev, DEVICE_STRING_SERIAL, string, maxlen);
 }
 
-int HID_API_EXPORT_CALL hid_get_indexed_string(hid_device *dev, int string_index, wchar_t *string, size_t maxlen)
+int HID_API_EXPORT_CALL hid_get_indexed_string(hid_device *, int, wchar_t *, size_t)
 {
-    (void *) dev;
-    (void *) string_index;
-    (void *) string;
-    (void *) maxlen;
 	return -1;
 }
 
