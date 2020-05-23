@@ -117,6 +117,19 @@ static void register_global_error(const char *msg)
 	last_global_error_str = utf8_to_wchar_t(msg);
 }
 
+/* See register_global_error, but you can pass a format string into this function. */
+static void register_global_error_format(const char *format, ...)
+{
+	va_list args;
+	va_start(args, format);
+
+	char msg[100];
+	vsnprintf(msg, sizeof(msg), format, args);
+
+	va_end(args);
+
+	register_global_error(msg);
+}
 
 /* Set the last error for a device to be reported by hid_error(device).
  * The given error message will be copied (and decoded according to the
@@ -152,11 +165,67 @@ static wchar_t *copy_udev_string(struct udev_device *dev, const char *udev_name)
 	return utf8_to_wchar_t(udev_device_get_sysattr_value(dev, udev_name));
 }
 
+/*
+ * Gets the size of the HID item at the given position
+ * Returns 1 if successful, 0 if an invalid key
+ * Sets data_len and key_size when successful
+ */
+static int get_hid_item_size(__u8 *report_descriptor, unsigned int pos, __u32 size, int *data_len, int *key_size)
+{
+	int key = report_descriptor[pos];
+	int size_code;
+
+	/*
+	 * This is a Long Item. The next byte contains the
+	 * length of the data section (value) for this key.
+	 * See the HID specification, version 1.11, section
+	 * 6.2.2.3, titled "Long Items."
+	 */
+	if ((key & 0xf0) == 0xf0) {
+		if (pos + 1 < size)
+		{
+			*data_len = report_descriptor[pos + 1];
+			*key_size = 3;
+			return 1;
+		}
+		*data_len = 0; /* malformed report */
+		*key_size = 0;
+	}
+
+	/*
+	 * This is a Short Item. The bottom two bits of the
+	 * key contain the size code for the data section
+	 * (value) for this key. Refer to the HID
+	 * specification, version 1.11, section 6.2.2.2,
+	 * titled "Short Items."
+	 */
+	size_code = key & 0x3;
+	switch (size_code) {
+	case 0:
+	case 1:
+	case 2:
+		*data_len = size_code;
+		*key_size = 1;
+		return 1;
+	case 3:
+		*data_len = 4;
+		*key_size = 1;
+		return 1;
+	default:
+		/* Can't ever happen since size_code is & 0x3 */
+		*data_len = 0;
+		*key_size = 0;
+		break;
+	};
+
+	/* malformed report */
+	return 0;
+}
+
 /* uses_numbered_reports() returns 1 if report_descriptor describes a device
    which contains numbered reports. */
 static int uses_numbered_reports(__u8 *report_descriptor, __u32 size) {
 	unsigned int i = 0;
-	int size_code;
 	int data_len, key_size;
 
 	while (i < size) {
@@ -169,42 +238,9 @@ static int uses_numbered_reports(__u8 *report_descriptor, __u32 size) {
 			return 1;
 		}
 
-		//printf("key: %02hhx\n", key);
-
-		if ((key & 0xf0) == 0xf0) {
-			/* This is a Long Item. The next byte contains the
-			   length of the data section (value) for this key.
-			   See the HID specification, version 1.11, section
-			   6.2.2.3, titled "Long Items." */
-			if (i+1 < size)
-				data_len = report_descriptor[i+1];
-			else
-				data_len = 0; /* malformed report */
-			key_size = 3;
-		}
-		else {
-			/* This is a Short Item. The bottom two bits of the
-			   key contain the size code for the data section
-			   (value) for this key.  Refer to the HID
-			   specification, version 1.11, section 6.2.2.2,
-			   titled "Short Items." */
-			size_code = key & 0x3;
-			switch (size_code) {
-			case 0:
-			case 1:
-			case 2:
-				data_len = size_code;
-				break;
-			case 3:
-				data_len = 4;
-				break;
-			default:
-				/* Can't ever happen since size_code is & 0x3 */
-				data_len = 0;
-				break;
-			};
-			key_size = 1;
-		}
+		/* Determine data_len and key_size */
+		if (!get_hid_item_size(report_descriptor, i, size, &data_len, &key_size))
+			return 0; /* malformed report */
 
 		/* Skip over this key and it's associated data */
 		i += data_len + key_size;
@@ -212,6 +248,138 @@ static int uses_numbered_reports(__u8 *report_descriptor, __u32 size) {
 
 	/* Didn't find a Report ID key. Device doesn't use numbered reports. */
 	return 0;
+}
+
+/*
+ * Get bytes from a HID Report Descriptor.
+ * Only call with a num_bytes of 0, 1, 2, or 4.
+ */
+static __u32 get_hid_report_bytes(__u8 *rpt, size_t len, size_t num_bytes, size_t cur)
+{
+	/* Return if there aren't enough bytes. */
+	if (cur + num_bytes >= len)
+		return 0;
+
+	if (num_bytes == 0)
+		return 0;
+	else if (num_bytes == 1)
+		return rpt[cur + 1];
+	else if (num_bytes == 2)
+		return (rpt[cur + 2] * 256 + rpt[cur + 1]);
+	else if (num_bytes == 4)
+		return (
+			rpt[cur + 4] * 0x01000000 +
+			rpt[cur + 3] * 0x00010000 +
+			rpt[cur + 2] * 0x00000100 +
+			rpt[cur + 1] * 0x00000001
+		);
+	else
+		return 0;
+}
+
+/*
+ * Retrieves the device's Usage Page and Usage from the report descriptor.
+ * The algorithm returns the current Usage Page/Usage pair whenever a new
+ * Collection is found and a Usage Local Item is currently in scope.
+ * Usage Local Items are consumed by each Main Item (See. 6.2.2.8).
+ * The algorithm should give similar results as Apple's:
+ *   https://developer.apple.com/documentation/iokit/kiohiddeviceusagepairskey?language=objc
+ * Physical Collections are also matched (macOS does the same).
+ *
+ * This function can be called repeatedly until it returns non-0
+ * Usage is found. pos is the starting point (initially 0) and will be updated
+ * to the next search position.
+ *
+ * The return value is 0 when a pair is found.
+ * 1 when finished processing descriptor.
+ * -1 on a malformed report.
+ */
+static int get_next_hid_usage(__u8 *report_descriptor, __u32 size, unsigned int *pos, unsigned short *usage_page, unsigned short *usage)
+{
+	int data_len, key_size;
+	int initial = *pos == 0; /* Used to handle case where no top-level application collection is defined */
+	int usage_pair_ready = 0;
+
+	/* Usage is a Local Item, it must be set before each Main Item (Collection) before a pair is returned */
+	int usage_found = 0;
+
+	while (*pos < size) {
+		int key = report_descriptor[*pos];
+		int key_cmd = key & 0xfc;
+
+		/* Determine data_len and key_size */
+		if (!get_hid_item_size(report_descriptor, *pos, size, &data_len, &key_size))
+			return -1; /* malformed report */
+
+		switch (key_cmd) {
+		case 0x4: /* Usage Page 6.2.2.7 (Global) */
+			*usage_page = get_hid_report_bytes(report_descriptor, size, data_len, *pos);
+			break;
+
+		case 0x8: /* Usage 6.2.2.8 (Local) */
+			*usage = get_hid_report_bytes(report_descriptor, size, data_len, *pos);
+			usage_found = 1;
+			break;
+
+		case 0xa0: /* Collection 6.2.2.4 (Main) */
+			/* A Usage Item (Local) must be found for the pair to be valid */
+			if (usage_found)
+				usage_pair_ready = 1;
+
+			/* Usage is a Local Item, unset it */
+			usage_found = 0;
+			break;
+
+		case 0x80: /* Input 6.2.2.4 (Main) */
+		case 0x90: /* Output 6.2.2.4 (Main) */
+		case 0xb0: /* Feature 6.2.2.4 (Main) */
+		case 0xc0: /* End Collection 6.2.2.4 (Main) */
+			/* Usage is a Local Item, unset it */
+			usage_found = 0;
+			break;
+		}
+
+		/* Skip over this key and it's associated data */
+		*pos += data_len + key_size;
+
+		/* Return usage pair */
+		if (usage_pair_ready)
+			return 0;
+	}
+
+	/* If no top-level application collection is found and usage page/usage pair is found, pair is valid
+	   https://docs.microsoft.com/en-us/windows-hardware/drivers/hid/top-level-collections */
+	if (initial && usage_found)
+		return 0; /* success */
+
+	return 1; /* finished processing */
+}
+
+/*
+ * Retrieves the hidraw report descriptor
+ */
+static int get_hid_report_descriptor(int device_handle, struct hidraw_report_descriptor *rpt_desc)
+{
+	int res, desc_size = 0;
+
+	memset(rpt_desc, 0x0, sizeof(*rpt_desc));
+
+	/* Get Report Descriptor Size */
+	res = ioctl(device_handle, HIDIOCGRDESCSIZE, &desc_size);
+	if (res < 0) {
+		register_global_error_format("ioctl (GRDESCSIZE): %s", strerror(errno));
+		return res;
+	}
+
+	/* Get Report Descriptor */
+	rpt_desc->size = desc_size;
+	res = ioctl(device_handle, HIDIOCGRDESC, rpt_desc);
+	if (res < 0) {
+		register_global_error_format("ioctl (GRDESC): %s", strerror(errno));
+		return res;
+	}
+
+	return res;
 }
 
 /*
@@ -566,6 +734,52 @@ struct hid_device_info  HID_API_EXPORT *hid_enumerate(unsigned short vendor_id, 
 					 * check for USB and Bluetooth devices above */
 					break;
 			}
+
+			/* Usage Page and Usage */
+			int res;
+			struct hidraw_report_descriptor rpt_desc;
+			int device_handle = open(dev_path, O_RDWR);
+			if (device_handle > 0) {
+				res = get_hid_report_descriptor(device_handle, &rpt_desc);
+				if (res >= 0) {
+					unsigned short page = 0, usage = 0;
+					unsigned int pos = 0, usage_count = 0;
+					/*
+					 * Parse the usage and usage page
+					 * out of the report descriptor.
+					 */
+					while (!get_next_hid_usage(rpt_desc.value, rpt_desc.size, &pos, &page, &usage)) {
+						usage_count++;
+
+						/* First usage */
+						if (usage_count == 1)
+						{
+							cur_dev->usage_page = page;
+							cur_dev->usage = usage;
+							continue;
+						}
+
+						/* Create new record for additional usage pairs */
+						tmp = (struct hid_device_info*) calloc(1, sizeof(struct hid_device_info));
+						cur_dev->next = tmp;
+						prev_dev = cur_dev;
+						cur_dev = tmp;
+
+						/* Update fields */
+						cur_dev->path = strdup(dev_path);
+						cur_dev->vendor_id = dev_vid;
+						cur_dev->product_id = dev_pid;
+						cur_dev->serial_number = utf8_to_wchar_t(serial_number_utf8);
+						cur_dev->release_number = prev_dev->release_number;
+						cur_dev->interface_number = prev_dev->interface_number;
+						cur_dev->manufacturer_string = prev_dev->manufacturer_string? wcsdup(prev_dev->manufacturer_string): NULL;
+						cur_dev->product_string = prev_dev->product_string? wcsdup(prev_dev->product_string): NULL;
+						cur_dev->usage_page = page;
+						cur_dev->usage = usage;
+					}
+				}
+				close(device_handle);
+			}
 		}
 
 	next:
@@ -657,22 +871,11 @@ hid_device * HID_API_EXPORT hid_open_path(const char *path)
 		register_device_error(dev, NULL);
 
 		/* Get the report descriptor */
-		int res, desc_size = 0;
+		int res;
 		struct hidraw_report_descriptor rpt_desc;
 
-		memset(&rpt_desc, 0x0, sizeof(rpt_desc));
-
-		/* Get Report Descriptor Size */
-		res = ioctl(dev->device_handle, HIDIOCGRDESCSIZE, &desc_size);
-		if (res < 0)
-			register_device_error_format(dev, "ioctl (GRDESCSIZE): %s", strerror(errno));
-
-		/* Get Report Descriptor */
-		rpt_desc.size = desc_size;
-		res = ioctl(dev->device_handle, HIDIOCGRDESC, &rpt_desc);
-		if (res < 0) {
-			register_device_error_format(dev, "ioctl (GRDESC): %s", strerror(errno));
-		} else {
+		res = get_hid_report_descriptor(dev->device_handle, &rpt_desc);
+		if (res >= 0) {
 			/* Determine if this device uses numbered reports. */
 			dev->uses_numbered_reports =
 				uses_numbered_reports(rpt_desc.value,
