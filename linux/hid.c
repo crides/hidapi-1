@@ -825,16 +825,16 @@ hid_device * hid_open(unsigned short vendor_id, unsigned short product_id, const
 	while (cur_dev) {
 		if (cur_dev->vendor_id == vendor_id &&
 		    cur_dev->product_id == product_id) {
-			/* if (serial_number) { */
-			/* 	if (wcscmp(serial_number, cur_dev->serial_number) == 0) { */
-			/* 		path_to_open = cur_dev->path; */
-			/* 		break; */
-			/* 	} */
-			/* } */
-			/* else { */
+			if (serial_number) {
+				if (wcscmp(serial_number, cur_dev->serial_number) == 0) {
+					path_to_open = cur_dev->path;
+					break;
+				}
+			}
+			else {
 				path_to_open = cur_dev->path;
 				break;
-			/* } */
+			}
 		}
 		cur_dev = cur_dev->next;
 	}
