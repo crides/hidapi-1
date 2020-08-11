@@ -767,7 +767,6 @@ struct hid_device_info  HID_API_EXPORT *hid_enumerate(unsigned short vendor_id, 
 
 						/* Update fields */
 						cur_dev->path = strdup(dev_path);
-                        printf("cur_dev->path: %s\n", cur_dev->path);
 						cur_dev->vendor_id = dev_vid;
 						cur_dev->product_id = dev_pid;
 						cur_dev->serial_number = utf8_to_wchar_t(serial_number_utf8);
